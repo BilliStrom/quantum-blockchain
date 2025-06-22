@@ -2,15 +2,20 @@ package blockchain
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/gob"
+	"errors"
+	"fmt"
 	"log"
+	"math/big"
+	"os"
 	"sync"
 	"time"
 	
 	"github.com/dgraph-io/badger"
 )
 
-// Block представляет структуру блока в блокчейне
 type Block struct {
 	Timestamp    int64
 	Transactions []*Transaction
@@ -20,7 +25,6 @@ type Block struct {
 	Validator    []byte
 }
 
-// Blockchain структура основной цепочки
 type Blockchain struct {
 	LastHash    []byte
 	Database    *badger.DB
@@ -28,30 +32,25 @@ type Blockchain struct {
 	mu          sync.Mutex
 }
 
-// Validator представляет участника стейкинга
 type Validator struct {
 	Address []byte
 	Stake   *big.Int
 }
 
-// Инициализация блокчейна
-func InitBlockchain(dataDir string) *Blockchain {
+func InitBlockchain(dataDir string) (*Blockchain, error) {
 	var lastHash []byte
 	
-	// Настройки BadgerDB
 	opts := badger.DefaultOptions(dataDir)
-	opts.Logger = nil // Отключаем логгер для чистоты вывода
+	opts.Logger = nil
 
 	db, err := badger.Open(opts)
 	if err != nil {
-		log.Panic(err)
+		return nil, fmt.Errorf("failed to open database: %v", err)
 	}
 
-	// Проверяем существование блокчейна
 	err = db.Update(func(txn *badger.Txn) error {
 		_, err := txn.Get([]byte("lh"))
 		if err == badger.ErrKeyNotFound {
-			// Создаем генезис-блок
 			genesis := GenesisBlock()
 			log.Println("✅ Genesis block created")
 			
@@ -63,23 +62,22 @@ func InitBlockchain(dataDir string) *Blockchain {
 			err = txn.Set([]byte("lh"), genesis.Hash)
 			lastHash = genesis.Hash
 			return err
-		} else {
-			// Загружаем последний хеш
-			item, err := txn.Get([]byte("lh"))
-			if err != nil {
-				return err
-			}
-			
-			err = item.Value(func(val []byte) error {
-				lastHash = append([]byte{}, val...)
-				return nil
-			})
+		}
+		
+		item, err := txn.Get([]byte("lh"))
+		if err != nil {
 			return err
 		}
+		
+		return item.Value(func(val []byte) error {
+			lastHash = append([]byte{}, val...)
+			return nil
+		})
 	})
 
 	if err != nil {
-		log.Panic(err)
+		db.Close()
+		return nil, fmt.Errorf("failed to initialize blockchain: %v", err)
 	}
 
 	bc := &Blockchain{
@@ -88,53 +86,45 @@ func InitBlockchain(dataDir string) *Blockchain {
 		Validators: make([]Validator, 0),
 	}
 	
-	// Инициализируем валидаторов
 	bc.InitValidators()
 	
-	return bc
+	return bc, nil
 }
 
-// Создание генезис-блока
 func GenesisBlock() *Block {
+	coinbase := CoinbaseTx([]byte("GENESIS_ADDRESS"), "Genesis block")
 	return &Block{
 		Timestamp:    time.Now().Unix(),
-		Transactions: []*Transaction{CoinbaseTx([]byte("GENESIS_ADDRESS"), "Genesis block")},
+		Transactions: []*Transaction{coinbase},
 		PrevHash:     []byte{},
 		Hash:         []byte("GENESIS_HASH"),
 		Validator:    []byte("GENESIS_VALIDATOR"),
 	}
 }
 
-// Сериализация блока
 func (b *Block) Serialize() []byte {
 	var res bytes.Buffer
 	encoder := gob.NewEncoder(&res)
-	err := encoder.Encode(b)
-	if err != nil {
-		log.Panic(err)
+	if err := encoder.Encode(b); err != nil {
+		log.Panic("serialization error:", err)
 	}
 	return res.Bytes()
 }
 
-// Десериализация блока
-func DeserializeBlock(data []byte) *Block {
+func DeserializeBlock(data []byte) (*Block, error) {
 	var block Block
 	decoder := gob.NewDecoder(bytes.NewReader(data))
-	err := decoder.Decode(&block)
-	if err != nil {
-		log.Panic(err)
+	if err := decoder.Decode(&block); err != nil {
+		return nil, err
 	}
-	return &block
+	return &block, nil
 }
 
-// Инициализация валидаторов
 func (bc *Blockchain) InitValidators() {
-	// Пример начальных валидаторов
 	bc.AddStake([]byte("VALIDATOR_ADDR_1"), big.NewInt(1000))
 	bc.AddStake([]byte("VALIDATOR_ADDR_2"), big.NewInt(500))
 }
 
-// Добавление стейка
 func (bc *Blockchain) AddStake(address []byte, amount *big.Int) {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
@@ -152,59 +142,62 @@ func (bc *Blockchain) AddStake(address []byte, amount *big.Int) {
 	})
 }
 
-// Выбор валидатора (упрощенный алгоритм)
-func (bc *Blockchain) SelectValidator() []byte {
+func (bc *Blockchain) SelectValidator() ([]byte, error) {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 	
 	if len(bc.Validators) == 0 {
-		return []byte("DEFAULT_VALIDATOR")
+		return nil, errors.New("no validators available")
 	}
 	
-	// Простой выбор валидатора с наибольшим стейком
-	selected := bc.Validators[0].Address
-	maxStake := bc.Validators[0].Stake
+	totalStake := new(big.Int)
+	for _, v := range bc.Validators {
+		totalStake.Add(totalStake, v.Stake)
+	}
 	
-	for _, v := range bc.Validators[1:] {
-		if v.Stake.Cmp(maxStake) > 0 {
-			maxStake = v.Stake
-			selected = v.Address
+	randValue, err := rand.Int(rand.Reader, totalStake)
+	if err != nil {
+		return nil, err
+	}
+	
+	current := new(big.Int)
+	for _, v := range bc.Validators {
+		current.Add(current, v.Stake)
+		if current.Cmp(randValue) > 0 {
+			return v.Address, nil
 		}
 	}
 	
-	return selected
+	return bc.Validators[len(bc.Validators)-1].Address, nil
 }
 
-// Добавление нового блока
-func (bc *Blockchain) AddBlock(transactions []*Transaction) {
+func (bc *Blockchain) AddBlock(transactions []*Transaction) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 	
 	var lastHash []byte
-	
-	// Получаем последний хеш
 	err := bc.Database.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte("lh"))
 		if err != nil {
 			return err
 		}
-		
-		err = item.Value(func(val []byte) error {
+		return item.Value(func(val []byte) error {
 			lastHash = append([]byte{}, val...)
 			return nil
 		})
-		return err
 	})
 	
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
 	
-	// Выбираем валидатора
-	validator := bc.SelectValidator()
-	log.Printf("🔒 Validator selected: %x (Stake: %d)\n", validator, bc.GetStake(validator))
+	validator, err := bc.SelectValidator()
+	if err != nil {
+		return err
+	}
 	
-	// Создаем новый блок
+	log.Printf("🔒 Validator selected: %x (Stake: %d)", validator, bc.GetStake(validator))
+	
 	newBlock := &Block{
 		Timestamp:    time.Now().Unix(),
 		Transactions: transactions,
@@ -212,31 +205,29 @@ func (bc *Blockchain) AddBlock(transactions []*Transaction) {
 		Validator:    validator,
 	}
 	
-	// Рассчитываем хеш блока
 	newBlock.Hash = newBlock.CalculateHash()
 	
-	// Сохраняем в базу данных
 	err = bc.Database.Update(func(txn *badger.Txn) error {
-		err := txn.Set(newBlock.Hash, newBlock.Serialize())
-		if err != nil {
+		if err := txn.Set(newBlock.Hash, newBlock.Serialize()); err != nil {
 			return err
 		}
-		
-		err = txn.Set([]byte("lh"), newBlock.Hash)
+		if err := txn.Set([]byte("lh"), newBlock.Hash); err != nil {
+			return err
+		}
 		bc.LastHash = newBlock.Hash
-		return err
+		return nil
 	})
 	
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
 	
-	log.Printf("🔗 Block %x added\n", newBlock.Hash)
+	log.Printf("🔗 Block %x added", newBlock.Hash)
+	return nil
 }
 
-// Расчет хеша блока
 func (b *Block) CalculateHash() []byte {
-	header := bytes.Join(
+	data := bytes.Join(
 		[][]byte{
 			b.PrevHash,
 			[]byte(time.Unix(b.Timestamp, 0).String()),
@@ -247,23 +238,22 @@ func (b *Block) CalculateHash() []byte {
 		[]byte{},
 	)
 	
-	hash := sha256.Sum256(header)
+	hash := sha256.Sum256(data)
 	return hash[:]
 }
 
-// Хеширование транзакций
 func (b *Block) HashTransactions() []byte {
 	var txHashes [][]byte
-	
 	for _, tx := range b.Transactions {
 		txHashes = append(txHashes, tx.ID)
 	}
 	
-	tree := NewMerkleTree(txHashes)
-	return tree.RootNode.Data
+	// В реальной реализации используйте Merkle tree
+	combined := bytes.Join(txHashes, []byte{})
+	hash := sha256.Sum256(combined)
+	return hash[:]
 }
 
-// Получение стейка валидатора
 func (bc *Blockchain) GetStake(address []byte) *big.Int {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
@@ -276,31 +266,65 @@ func (bc *Blockchain) GetStake(address []byte) *big.Int {
 	return big.NewInt(0)
 }
 
-// Получение последнего блока
-func (bc *Blockchain) GetLastBlock() *Block {
-	var lastBlock *Block
+func (bc *Blockchain) GetLastBlock() (*Block, error) {
+	var blockBytes []byte
 	
 	err := bc.Database.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(bc.LastHash)
 		if err != nil {
 			return err
 		}
-		
-		err = item.Value(func(val []byte) error {
-			lastBlock = DeserializeBlock(val)
+		return item.Value(func(val []byte) error {
+			blockBytes = append([]byte{}, val...)
 			return nil
 		})
-		return err
 	})
 	
 	if err != nil {
-		log.Panic(err)
+		return nil, err
 	}
 	
-	return lastBlock
+	return DeserializeBlock(blockBytes)
 }
 
-// Закрытие базы данных
+func (bc *Blockchain) GetBalance(address []byte) *big.Int {
+	balance := big.NewInt(0)
+	
+	// Упрощенная реализация - в реальном проекте нужно учитывать UTXO
+	err := bc.Database.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			err := item.Value(func(val []byte) error {
+				block, err := DeserializeBlock(val)
+				if err != nil {
+					return err
+				}
+				
+				for _, tx := range block.Transactions {
+					if bytes.Equal(tx.To, address) {
+						balance.Add(balance, tx.Value)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	
+	if err != nil {
+		log.Printf("Error calculating balance: %v", err)
+	}
+	
+	return balance
+}
+
 func (bc *Blockchain) Close() {
 	if err := bc.Database.Close(); err != nil {
 		log.Printf("Error closing database: %v", err)
