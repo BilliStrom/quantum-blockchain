@@ -7,9 +7,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"quantum-blockchain/blockchain"
-	"quantum-blockchain/p2p"
-	"quantum-blockchain/rpc"
+	"github.com/BilliStrom/quantum-blockchain/blockchain"
+    "github.com/BilliStrom/quantum-blockchain/p2p"
+    "github.com/BilliStrom/quantum-blockchain/rpc"
 	"syscall"
 	"time"
 )
